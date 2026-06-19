@@ -77,3 +77,14 @@ func (l *Lock) Refresh(ctx context.Context, ttl time.Duration) (bool, error) {
 func (l *Lock) Key() string {
 	return l.key
 }
+
+func (d *DistributedLock) ForceRelease(ctx context.Context, key string) error {
+	deleted, err := d.client.Del(ctx, key).Result()
+	if err != nil {
+		return fmt.Errorf("force release lock failed: %w", err)
+	}
+	if deleted == 0 {
+		return fmt.Errorf("force release lock: key %s does not exist", key)
+	}
+	return nil
+}

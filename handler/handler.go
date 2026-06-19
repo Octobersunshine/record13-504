@@ -22,6 +22,10 @@ type RunTaskRequest struct {
 	Duration int    `json:"duration_seconds"`
 }
 
+type ReleaseTaskRequest struct {
+	TaskID string `json:"task_id" binding:"required"`
+}
+
 func NewTaskHandler(taskSvc *task.TaskService) *TaskHandler {
 	return &TaskHandler{
 		taskSvc:    taskSvc,
@@ -60,6 +64,76 @@ func (h *TaskHandler) RunTask(c *gin.Context) {
 	})
 
 	c.JSON(http.StatusOK, result)
+}
+
+func (h *TaskHandler) ReleaseTask(c *gin.Context) {
+	var req ReleaseTaskRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "参数错误: " + err.Error(),
+		})
+		return
+	}
+
+	if err := h.taskSvc.ReleaseTask(c.Request.Context(), req.TaskID); err != nil {
+		if errors.Is(err, task.ErrTaskNotActive) {
+			c.JSON(http.StatusNotFound, gin.H{
+				"success": false,
+				"message": "当前实例未持有该任务的锁，无法手动释放",
+				"task_id": req.TaskID,
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "手动释放锁失败: " + err.Error(),
+			"task_id": req.TaskID,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "任务锁已手动释放",
+		"task_id": req.TaskID,
+	})
+}
+
+func (h *TaskHandler) ForceReleaseTask(c *gin.Context) {
+	var req ReleaseTaskRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "参数错误: " + err.Error(),
+		})
+		return
+	}
+
+	if err := h.taskSvc.ForceReleaseLock(c.Request.Context(), req.TaskID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "强制释放锁失败: " + err.Error(),
+			"task_id": req.TaskID,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "任务锁已强制释放",
+		"task_id": req.TaskID,
+	})
+}
+
+func (h *TaskHandler) ListActiveTasks(c *gin.Context) {
+	tasks := h.taskSvc.ListActiveTasks()
+	c.JSON(http.StatusOK, gin.H{
+		"success":     true,
+		"instance_id": h.instanceID,
+		"active_tasks": tasks,
+		"count":       len(tasks),
+	})
 }
 
 func (h *TaskHandler) Health(c *gin.Context) {

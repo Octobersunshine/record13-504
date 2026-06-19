@@ -4,17 +4,29 @@ import (
 	"context"
 	"errors"
 	"log"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"distributed-lock-demo/lock"
 )
 
 var ErrLockLost = errors.New("分布式锁已丢失，任务被中断")
+var ErrTaskNotActive = errors.New("当前实例未持有该任务的锁")
+
+type lockHolder struct {
+	lock          *lock.Lock
+	cancelTask    context.CancelFunc
+	cancelRefresh context.CancelFunc
+	acquiredAt    time.Time
+	released      atomic.Bool
+}
 
 type TaskService struct {
 	lockSvc    *lock.DistributedLock
 	lockTTL    time.Duration
 	refreshInt time.Duration
+	holders    sync.Map
 }
 
 type TaskResult struct {
@@ -23,6 +35,12 @@ type TaskResult struct {
 	TaskID    string `json:"task_id,omitempty"`
 	Executed  bool   `json:"executed"`
 	Instance  string `json:"instance_id"`
+}
+
+type ActiveTaskInfo struct {
+	TaskID     string `json:"task_id"`
+	LockKey    string `json:"lock_key"`
+	AcquiredAt string `json:"acquired_at"`
 }
 
 func NewTaskService(lockSvc *lock.DistributedLock) *TaskService {
@@ -67,28 +85,43 @@ func (s *TaskService) ExecuteTask(ctx context.Context, taskID string, instanceID
 	refreshCtx, refreshCancel := context.WithCancel(context.Background())
 	defer refreshCancel()
 
+	holder := &lockHolder{
+		lock:          acquiredLock,
+		cancelTask:    taskCancel,
+		cancelRefresh: refreshCancel,
+		acquiredAt:    time.Now(),
+	}
+	s.holders.Store(taskID, holder)
+
 	go s.startLockRefresher(refreshCtx, taskCancel, acquiredLock, s.refreshInt, s.lockTTL, instanceID)
 
 	defer func() {
+		s.holders.Delete(taskID)
 		refreshCancel()
 		taskCancel()
 
+		if holder.released.Load() {
+			log.Printf("[%s] 锁已被手动释放，跳过重复释放: %s", instanceID, taskID)
+			return
+		}
+
 		if errors.Is(taskCtx.Err(), context.Canceled) {
 			log.Printf("[%s] 锁已丢失，跳过主动释放: %s", instanceID, taskID)
+			return
+		}
+
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer releaseCancel()
+		if err := acquiredLock.Release(releaseCtx); err != nil {
+			log.Printf("[%s] 释放锁失败: %v", instanceID, err)
 		} else {
-			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer releaseCancel()
-			if err := acquiredLock.Release(releaseCtx); err != nil {
-				log.Printf("[%s] 释放锁失败: %v", instanceID, err)
-			} else {
-				log.Printf("[%s] 已释放任务锁: %s", instanceID, taskID)
-			}
+			log.Printf("[%s] 已释放任务锁: %s", instanceID, taskID)
 		}
 	}()
 
 	log.Printf("[%s] 开始执行任务: %s", instanceID, taskID)
 	if err := workFn(taskCtx); err != nil {
-		if errors.Is(taskCtx.Err(), context.Canceled) {
+		if errors.Is(taskCtx.Err(), context.Canceled) && !holder.released.Load() {
 			log.Printf("[%s] 任务因锁丢失被中断: %s", instanceID, taskID)
 			return &TaskResult{
 				Success:  false,
@@ -108,7 +141,7 @@ func (s *TaskService) ExecuteTask(ctx context.Context, taskID string, instanceID
 		}
 	}
 
-	if errors.Is(taskCtx.Err(), context.Canceled) {
+	if errors.Is(taskCtx.Err(), context.Canceled) && !holder.released.Load() {
 		log.Printf("[%s] 任务因锁丢失被中断: %s", instanceID, taskID)
 		return &TaskResult{
 			Success:  false,
@@ -127,6 +160,65 @@ func (s *TaskService) ExecuteTask(ctx context.Context, taskID string, instanceID
 		Executed: true,
 		Instance: instanceID,
 	}
+}
+
+func (s *TaskService) ReleaseTask(ctx context.Context, taskID string) error {
+	val, ok := s.holders.Load(taskID)
+	if !ok {
+		return ErrTaskNotActive
+	}
+
+	holder := val.(*lockHolder)
+	if !holder.released.CompareAndSwap(false, true) {
+		return ErrTaskNotActive
+	}
+
+	log.Printf("手动释放任务锁: %s", taskID)
+
+	holder.cancelRefresh()
+	holder.cancelTask()
+
+	releaseCtx, releaseCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer releaseCancel()
+
+	if err := holder.lock.Release(releaseCtx); err != nil {
+		log.Printf("手动释放锁失败: %v", err)
+		return err
+	}
+
+	s.holders.Delete(taskID)
+	log.Printf("手动释放任务锁成功: %s", taskID)
+	return nil
+}
+
+func (s *TaskService) ForceReleaseLock(ctx context.Context, taskID string) error {
+	lockKey := "task:lock:" + taskID
+
+	val, ok := s.holders.Load(taskID)
+	if ok {
+		holder := val.(*lockHolder)
+		holder.released.Store(true)
+		holder.cancelRefresh()
+		holder.cancelTask()
+		s.holders.Delete(taskID)
+	}
+
+	log.Printf("强制释放锁: %s (key: %s)", taskID, lockKey)
+	return s.lockSvc.ForceRelease(ctx, lockKey)
+}
+
+func (s *TaskService) ListActiveTasks() []ActiveTaskInfo {
+	var tasks []ActiveTaskInfo
+	s.holders.Range(func(key, value any) bool {
+		holder := value.(*lockHolder)
+		tasks = append(tasks, ActiveTaskInfo{
+			TaskID:     key.(string),
+			LockKey:    holder.lock.Key(),
+			AcquiredAt: holder.acquiredAt.Format(time.RFC3339),
+		})
+		return true
+	})
+	return tasks
 }
 
 func (s *TaskService) startLockRefresher(ctx context.Context, onLockLost context.CancelFunc, l *lock.Lock, interval time.Duration, ttl time.Duration, instanceID string) {

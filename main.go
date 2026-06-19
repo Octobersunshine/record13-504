@@ -40,6 +40,9 @@ func main() {
 	r := gin.Default()
 	r.GET("/health", taskHandler.Health)
 	r.POST("/task/run", taskHandler.RunTask)
+	r.POST("/task/release", taskHandler.ReleaseTask)
+	r.POST("/task/force-release", taskHandler.ForceReleaseTask)
+	r.GET("/task/active", taskHandler.ListActiveTasks)
 
 	go func() {
 		log.Println("HTTP服务启动,监听端口:", httpPort)
