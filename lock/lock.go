@@ -21,7 +21,6 @@ type Lock struct {
 	client *redis.Client
 	key    string
 	value  string
-	ctx    context.Context
 }
 
 var unlockScript = redis.NewScript(`
@@ -53,12 +52,11 @@ func (d *DistributedLock) Acquire(ctx context.Context, key string, ttl time.Dura
 		client: d.client,
 		key:    key,
 		value:  value,
-		ctx:    ctx,
 	}, true, nil
 }
 
-func (l *Lock) Release() error {
-	result, err := unlockScript.Run(l.ctx, l.client, []string{l.key}, l.value).Result()
+func (l *Lock) Release(ctx context.Context) error {
+	result, err := unlockScript.Run(ctx, l.client, []string{l.key}, l.value).Result()
 	if err != nil {
 		return fmt.Errorf("release lock failed: %w", err)
 	}
@@ -68,8 +66,8 @@ func (l *Lock) Release() error {
 	return nil
 }
 
-func (l *Lock) Refresh(ttl time.Duration) (bool, error) {
-	result, err := refreshScript.Run(l.ctx, l.client, []string{l.key}, l.value, ttl.Milliseconds()).Result()
+func (l *Lock) Refresh(ctx context.Context, ttl time.Duration) (bool, error) {
+	result, err := refreshScript.Run(ctx, l.client, []string{l.key}, l.value, ttl.Milliseconds()).Result()
 	if err != nil {
 		return false, fmt.Errorf("refresh lock failed: %w", err)
 	}

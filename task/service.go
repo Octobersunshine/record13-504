@@ -2,11 +2,14 @@ package task
 
 import (
 	"context"
+	"errors"
 	"log"
 	"time"
 
 	"distributed-lock-demo/lock"
 )
+
+var ErrLockLost = errors.New("分布式锁已丢失，任务被中断")
 
 type TaskService struct {
 	lockSvc    *lock.DistributedLock
@@ -30,7 +33,9 @@ func NewTaskService(lockSvc *lock.DistributedLock) *TaskService {
 	}
 }
 
-func (s *TaskService) ExecuteTask(ctx context.Context, taskID string, instanceID string, workFn func() error) *TaskResult {
+type WorkFunc func(ctx context.Context) error
+
+func (s *TaskService) ExecuteTask(ctx context.Context, taskID string, instanceID string, workFn WorkFunc) *TaskResult {
 	lockKey := "task:lock:" + taskID
 
 	acquiredLock, ok, err := s.lockSvc.Acquire(ctx, lockKey, s.lockTTL)
@@ -56,28 +61,60 @@ func (s *TaskService) ExecuteTask(ctx context.Context, taskID string, instanceID
 
 	log.Printf("[%s] 成功获取任务锁: %s", instanceID, taskID)
 
-	refreshCtx, cancelRefresh := context.WithCancel(ctx)
-	defer cancelRefresh()
+	taskCtx, taskCancel := context.WithCancel(ctx)
+	defer taskCancel()
 
-	go s.startLockRefresher(refreshCtx, acquiredLock, s.refreshInt, s.lockTTL, instanceID)
+	refreshCtx, refreshCancel := context.WithCancel(context.Background())
+	defer refreshCancel()
+
+	go s.startLockRefresher(refreshCtx, taskCancel, acquiredLock, s.refreshInt, s.lockTTL, instanceID)
 
 	defer func() {
-		cancelRefresh()
-		if err := acquiredLock.Release(); err != nil {
-			log.Printf("[%s] 释放锁失败: %v", instanceID, err)
+		refreshCancel()
+		taskCancel()
+
+		if errors.Is(taskCtx.Err(), context.Canceled) {
+			log.Printf("[%s] 锁已丢失，跳过主动释放: %s", instanceID, taskID)
 		} else {
-			log.Printf("[%s] 已释放任务锁: %s", instanceID, taskID)
+			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer releaseCancel()
+			if err := acquiredLock.Release(releaseCtx); err != nil {
+				log.Printf("[%s] 释放锁失败: %v", instanceID, err)
+			} else {
+				log.Printf("[%s] 已释放任务锁: %s", instanceID, taskID)
+			}
 		}
 	}()
 
 	log.Printf("[%s] 开始执行任务: %s", instanceID, taskID)
-	if err := workFn(); err != nil {
+	if err := workFn(taskCtx); err != nil {
+		if errors.Is(taskCtx.Err(), context.Canceled) {
+			log.Printf("[%s] 任务因锁丢失被中断: %s", instanceID, taskID)
+			return &TaskResult{
+				Success:  false,
+				Message:  ErrLockLost.Error(),
+				TaskID:   taskID,
+				Executed: false,
+				Instance: instanceID,
+			}
+		}
 		log.Printf("[%s] 任务执行失败: %s, err: %v", instanceID, taskID, err)
 		return &TaskResult{
 			Success:  false,
 			Message:  "任务执行失败: " + err.Error(),
 			TaskID:   taskID,
 			Executed: true,
+			Instance: instanceID,
+		}
+	}
+
+	if errors.Is(taskCtx.Err(), context.Canceled) {
+		log.Printf("[%s] 任务因锁丢失被中断: %s", instanceID, taskID)
+		return &TaskResult{
+			Success:  false,
+			Message:  ErrLockLost.Error(),
+			TaskID:   taskID,
+			Executed: false,
 			Instance: instanceID,
 		}
 	}
@@ -92,7 +129,7 @@ func (s *TaskService) ExecuteTask(ctx context.Context, taskID string, instanceID
 	}
 }
 
-func (s *TaskService) startLockRefresher(ctx context.Context, l *lock.Lock, interval time.Duration, ttl time.Duration, instanceID string) {
+func (s *TaskService) startLockRefresher(ctx context.Context, onLockLost context.CancelFunc, l *lock.Lock, interval time.Duration, ttl time.Duration, instanceID string) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -101,16 +138,54 @@ func (s *TaskService) startLockRefresher(ctx context.Context, l *lock.Lock, inte
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			ok, err := l.Refresh(ttl)
+			refreshCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ok, err := l.Refresh(refreshCtx, ttl)
+			cancel()
+
 			if err != nil {
-				log.Printf("[%s] 刷新锁异常: %v", instanceID, err)
+				log.Printf("[%s] 刷新锁异常，尝试重新续约: %v", instanceID, err)
+				s.retryRefresh(ctx, l, ttl, instanceID, onLockLost)
 				return
 			}
 			if !ok {
-				log.Printf("[%s] 锁已失效，停止刷新", instanceID)
+				log.Printf("[%s] 锁已失效，取消任务执行", instanceID)
+				onLockLost()
 				return
 			}
 			log.Printf("[%s] 锁已续约", instanceID)
 		}
 	}
+}
+
+func (s *TaskService) retryRefresh(ctx context.Context, l *lock.Lock, ttl time.Duration, instanceID string, onLockLost context.CancelFunc) {
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		time.Sleep(time.Duration(i+1) * time.Second)
+
+		refreshCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ok, err := l.Refresh(refreshCtx, ttl)
+		cancel()
+
+		if err != nil {
+			log.Printf("[%s] 重试续约失败 (%d/%d): %v", instanceID, i+1, maxRetries, err)
+			continue
+		}
+		if !ok {
+			log.Printf("[%s] 重试续约发现锁已失效，取消任务执行", instanceID)
+			onLockLost()
+			return
+		}
+
+		log.Printf("[%s] 重试续约成功", instanceID)
+		return
+	}
+
+	log.Printf("[%s] 重试续约全部失败，取消任务执行", instanceID)
+	onLockLost()
 }

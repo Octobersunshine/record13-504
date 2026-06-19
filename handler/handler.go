@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"time"
@@ -42,8 +43,16 @@ func (h *TaskHandler) RunTask(c *gin.Context) {
 		req.Duration = 5
 	}
 
-	result := h.taskSvc.ExecuteTask(c.Request.Context(), req.TaskID, h.instanceID, func() error {
-		time.Sleep(time.Duration(req.Duration) * time.Second)
+	result := h.taskSvc.ExecuteTask(c.Request.Context(), req.TaskID, h.instanceID, func(ctx context.Context) error {
+		timer := time.NewTimer(time.Duration(req.Duration) * time.Second)
+		defer timer.Stop()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
+
 		if req.TaskID == "fail-task" {
 			return errors.New("模拟任务失败")
 		}
